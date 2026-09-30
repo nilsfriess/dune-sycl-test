@@ -1,0 +1,224 @@
+#pragma once
+
+#include <cassert>
+#include <cstdint>
+#include <dune/common/exceptions.hh>
+#include <dune/common/fmatrix.hh>
+#include <dune/istl/bcrsmatrix.hh>
+#include <dune/istl/foreach.hh>
+#include <format>
+#include <memory>
+#include <span>
+#include <sycl/sycl.hpp>
+#include <vector>
+
+template <class... Args>
+inline void check_impl(const char* file, int line, bool condition, std::format_string<Args...> fmt, Args&&... args)
+{
+  if (!condition) [[unlikely]]
+    DUNE_THROW(Dune::InvalidStateException, "\n") << file << ":" << line << ": CHECK failed: " << std::format(fmt, std::forward<Args>(args)...);
+}
+
+// MCHECK is for throws and exception instead
+#define MCHECK(cond, ...) check_impl(__FILE__, __LINE__, (cond), __VA_ARGS__)
+
+template <class Scalar, class Index>
+class SyclVec;
+
+template <class Scalar, class Index = std::uint_least32_t>
+class SyclMat {
+public:
+  using block_type = Scalar;
+  using field_type = Scalar;
+  using index_type = Index;
+  using allocator_type = std::allocator<Scalar>;
+
+  SyclMat(const sycl::queue& q_, Index rows_, Index cols_, std::span<const Index> host_r, std::span<const Index> host_c, std::span<const block_type> host_a)
+      : q(q_)
+      , rows(rows_)
+      , cols(cols_)
+      , r(sycl::malloc_device<Index>(host_r.size(), q))
+      , c(sycl::malloc_device<Index>(host_c.size(), q))
+      , a(sycl::malloc_device<block_type>(host_a.size(), q))
+      , nnz(host_a.size())
+  {
+    MCHECK(host_c.size() == host_a.size(), "Invalid CSR data (column index array size {} and data array size {} do not match)", host_c.size(), host_a.size());
+    MCHECK(host_r.size() == rows + 1, "Invalid CSR data (row offsets array size {} does not match the provided number of rows {})", host_r.size(), rows + 1);
+
+    q.memcpy(r, host_r.data(), host_r.size_bytes());
+    q.memcpy(c, host_c.data(), host_c.size_bytes());
+    q.memcpy(a, host_a.data(), host_a.size_bytes());
+    // The copies are asynchronous and read from the caller's host buffers, so we must
+    // not return before they have completed (the caller can then free the host buffers)
+    q.wait();
+  }
+
+  SyclMat(const SyclMat&) = delete;
+  SyclMat& operator=(const SyclMat&) = delete;
+
+  // Note: nnz MUST be moved along with r/c/a; nonzeros() would otherwise report
+  // garbage after a move (e.g. when from_bcrs's return value is moved into a
+  // shared_ptr), which silently corrupts every consumer of the CSR description.
+  SyclMat(SyclMat&& other) noexcept
+      : q(other.q)
+      , rows(other.rows)
+      , cols(other.cols)
+      , r(other.r)
+      , c(other.c)
+      , a(other.a)
+      , nnz(other.nnz)
+  {
+    other.rows = 0;
+    other.cols = 0;
+    other.r = nullptr;
+    other.c = nullptr;
+    other.a = nullptr;
+    other.nnz = 0;
+  }
+
+  SyclMat& operator=(SyclMat&& other) noexcept
+  {
+    if (this != &other) {
+      q = other.q;
+      rows = other.rows;
+      cols = other.cols;
+      r = other.r;
+      c = other.c;
+      a = other.a;
+      nnz = other.nnz;
+
+      other.rows = 0;
+      other.cols = 0;
+      other.r = nullptr;
+      other.c = nullptr;
+      other.a = nullptr;
+      other.nnz = 0;
+    }
+    return *this;
+  }
+
+  ~SyclMat()
+  {
+    if (r || c || a) q.wait(); // no kernel may still be reading r/c/a when we free them
+    if (r) sycl::free(r, q);
+    if (c) sycl::free(c, q);
+    if (a) sycl::free(a, q);
+  }
+
+  template <int d, class Allocator>
+  static SyclMat from_bcrs(sycl::queue& q, const Dune::BCRSMatrix<Dune::FieldMatrix<Scalar, d, d>, Allocator>& A)
+  {
+    Index nnz = 0;
+    const auto [fr, fc] = Dune::flatMatrixForEach(A, [&](auto&&, auto&&, auto&&) { ++nnz; });
+    Index N = fr;
+
+    std::vector<Index> row_ptr(N + 1, 0);
+    std::vector<Index> col_ind(nnz, 0);
+    std::vector<Scalar> values(nnz, 0);
+
+    // Count number of entries per row and accumulate
+    flatMatrixForEach(A, [&](auto&&, auto&& row, auto&&) { row_ptr[row + 1] += 1; });
+    for (Index i = 0; i < N; ++i) row_ptr[i + 1] += row_ptr[i];
+
+    assert(row_ptr[N] == nnz);
+
+    // Now fill the other two arrays
+    std::vector<Index> row_pos(N, 0); // position counter in each row
+    flatMatrixForEach(A, [&](auto&& entry, auto&& row, auto&& col) {
+      auto row_start = row_ptr[row];
+
+      col_ind[row_start + row_pos[row]] = col;
+      values[row_start + row_pos[row]] = entry;
+
+      row_pos[row] += 1;
+    });
+
+    return SyclMat(q, N, N, {row_ptr.data(), row_ptr.size()}, {col_ind.data(), col_ind.size()}, {values.data(), values.size()});
+  }
+
+  Index N() const { return rows; }
+  Index M() const { return cols; }
+
+  void usmv(Scalar alpha, const SyclVec<Scalar, Index>& x, SyclVec<Scalar, Index>& y) const
+  {
+    auto* y_data = y.data();
+    const auto* const x_data = x.data();
+
+    const auto* rr = r;
+    const auto* cc = c;
+    const auto* aa = a;
+
+    q.parallel_for(sycl::range<1>(rows), [=](auto idx) {
+      const auto row = idx[0];
+      const auto row_start = rr[row];
+      const auto row_end = rr[row + 1];
+
+      block_type sum{0};
+      for (auto k = row_start; k < row_end; ++k) sum += alpha * aa[k] * x_data[cc[k]];
+      y_data[row] += sum;
+    });
+  }
+
+  void mv(const SyclVec<Scalar, Index>& x, SyclVec<Scalar, Index>& y) const
+  {
+    auto* y_data = y.data();
+    const auto* const x_data = x.data();
+
+    const auto* rr = r;
+    const auto* cc = c;
+    const auto* aa = a;
+
+    q.parallel_for(sycl::range<1>(rows), [=](auto idx) {
+      const auto row = idx[0];
+      const auto row_start = rr[row];
+      const auto row_end = rr[row + 1];
+
+      block_type sum{0};
+      for (auto k = row_start; k < row_end; ++k) sum += aa[k] * x_data[cc[k]];
+      y_data[row] = sum;
+    });
+  }
+
+  SyclVec<Scalar, Index> getdiag() const
+  {
+    MCHECK(rows == cols, "getdiag only for square matrices");
+    SyclVec<Scalar, Index> diag(q, rows);
+
+    const auto* rr = r;
+    const auto* cc = c;
+    const auto* aa = a;
+    // Must be a plain pointer: capturing `diag` itself would copy the whole Vec
+    // (and thus submit to `q`) from inside the submission of this kernel.
+    auto* dd = diag.data();
+
+    q.parallel_for(sycl::range<1>(rows), [=](auto idx) {
+       const auto row = idx[0];
+       const auto row_start = rr[row];
+       const auto row_end = rr[row + 1];
+
+       block_type d{0};
+       for (auto k = row_start; k < row_end; ++k)
+         if (cc[k] == row) d = aa[k];
+       dd[row] = d;
+     }).wait();
+    return diag;
+  }
+
+  Index nonzeros() const { return nnz; }
+  const Index* row_offsets() const { return r; }
+  const Index* column_indices() const { return c; }
+  const block_type* values() const { return a; }
+
+  sycl::queue queue() const { return q; }
+
+private:
+  mutable sycl::queue q; // q.parallel_for is not const, but this->mv needs to be const
+
+  Index rows{};
+  Index cols{};
+
+  Index* r = nullptr;
+  Index* c = nullptr;
+  block_type* a = nullptr;
+  Index nnz{};
+};

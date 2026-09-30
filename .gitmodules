@@ -1,0 +1,20 @@
+[submodule "extern/dune-common"]
+	path = extern/dune-common
+	url = https://gitlab.dune-project.org/core/dune-common.git
+	branch = master
+[submodule "extern/dune-istl"]
+	path = extern/dune-istl
+	url = https://gitlab.dune-project.org/core/dune-istl.git
+	branch = master
+[submodule "extern/dune-geometry"]
+	path = extern/dune-geometry
+	url = https://gitlab.dune-project.org/core/dune-geometry.git
+	branch = master
+[submodule "extern/dune-localfunctions"]
+	path = extern/dune-localfunctions
+	url = https://gitlab.dune-project.org/core/dune-localfunctions.git
+	branch = master
+[submodule "extern/dune-grid"]
+	path = extern/dune-grid
+	url = https://gitlab.dune-project.org/core/dune-grid.git
+	branch = master
